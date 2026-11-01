@@ -363,6 +363,59 @@ jobs:
           cat "$GITHUB_WORKSPACE/collect.json"
 
       # ---------------------------------------------------------------------
+      # Step 12b: Sign release APKs with the owner's persistent private key.
+      # The uploaded source ZIP is untrusted; signing happens only after the
+      # build, and secrets are never passed to Gradle or source-project scripts.
+      # ---------------------------------------------------------------------
+      - name: Sign release APKs
+        if: inputs.build_variant == 'release' && steps.collect.outputs.apk_count != '0' && steps.collect.outputs.apk_count != ''
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in RELEASE_KEYSTORE_BASE64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+
+          KEYSTORE="$RUNNER_TEMP/optic-shema-release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::error::Android build-tools apksigner was not found"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          APK_FILES=("$GITHUB_WORKSPACE/output"/*.apk)
+          if [ ${#APK_FILES[@]} -eq 0 ]; then
+            echo "::error::No APK files found to sign"
+            exit 1
+          fi
+
+          for apk in "${APK_FILES[@]}"; do
+            echo "Signing $(basename "$apk")"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-key-alias "$RELEASE_KEY_ALIAS" \
+              --ks-pass env:RELEASE_STORE_PASSWORD \
+              --key-pass env:RELEASE_KEY_PASSWORD \
+              "$apk"
+            "$APKSIGNER" verify --verbose --print-certs "$apk"
+          done
+
+          rm -f "$KEYSTORE"
+          echo "✓ Release APK(s) signed and verified."
+
+      # ---------------------------------------------------------------------
       # Step 13: Upload APK artifact
       # ---------------------------------------------------------------------
       - name: Upload APK artifact
