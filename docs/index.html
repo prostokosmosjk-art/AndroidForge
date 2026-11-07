@@ -720,23 +720,41 @@
         }
         window._dispatched = dispatched;
 
-        // 5. Wait briefly, then find the workflow_dispatch run(s).
+        // 5. Find ONLY the run(s) created from the exact commit uploaded above.
+        //    GitHub may return older workflow_dispatch runs first (or before the
+        //    new run has appeared). Never select a run by branch/event alone.
         els.progressBar.style.width = "15%";
-        appendLog("→ Waiting for workflow run to register…");
-        els.uploadStatus.textContent = "waiting for run…";
-        await sleep(8000);
-        const runs = await apiJson(`/repos/${c.owner}/${c.repo}/actions/runs?per_page=8&event=workflow_dispatch`);
-        // Find the most recent dispatch runs on this branch — there might
-        // be two (android + desktop) if the user picked "all".
-        const dispatchedRuns = (runs.workflow_runs || []).filter(r =>
-          r.head_branch === repoInfo.default_branch && r.event === "workflow_dispatch"
-        );
-        if (dispatchedRuns.length === 0) throw new Error("Could not find the dispatched workflow run");
-        // We'll track all dispatched runs (typically 1, up to 2 for "all").
-        // For UI simplicity, poll only the most recent run (the second-dispatched
-        // one — usually the desktop workflow). The release-fetch step at the
-        // end queries all three possible tags (web-build-output-<id>,
-        // web-build-output-<id>-linux, web-build-output-<id>-windows).
+        appendLog("→ Waiting for the workflow run tied to this upload…");
+        els.uploadStatus.textContent = "waiting for matching run…";
+        const expectedSha = window._currentCommitSha;
+        const dispatchStartedAt = new Date(Date.now() - 5000).toISOString();
+        const expectedWorkflows = dispatched.map(d => d.workflowId);
+        let dispatchedRuns = [];
+        for (let attempt = 1; attempt <= 18; attempt++) {
+          const runs = await apiJson(`/repos/${c.owner}/${c.repo}/actions/runs?per_page=30&event=workflow_dispatch`);
+          dispatchedRuns = (runs.workflow_runs || []).filter(r =>
+            r.head_branch === repoInfo.default_branch &&
+            r.event === "workflow_dispatch" &&
+            r.head_sha === expectedSha &&
+            expectedWorkflows.includes(r.path.split("/").pop())
+          );
+          if (dispatchedRuns.length >= expectedWorkflows.length) break;
+          appendLog(`  ⏳ Matching run not visible yet (attempt ${attempt}/18); ignoring older runs…`);
+          await sleep(5000);
+        }
+        if (dispatchedRuns.length === 0) {
+          throw new Error(`No workflow run found for uploaded commit ${expectedSha.slice(0, 7)}. Older runs were deliberately ignored.`);
+        }
+        // Keep only the newest matching run per workflow, never a run from a
+        // previous upload. For "all", poll the latest matching run and retain
+        // every matching run ID for release lookup.
+        dispatchedRuns.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        const uniqueByWorkflow = new Map();
+        for (const r of dispatchedRuns) {
+          const key = r.path.split("/").pop();
+          if (!uniqueByWorkflow.has(key)) uniqueByWorkflow.set(key, r);
+        }
+        dispatchedRuns = Array.from(uniqueByWorkflow.values());
         const primaryRun = dispatchedRuns[0];
         window._currentRunId = primaryRun.id;
         window._allRunIds = dispatchedRuns.map(r => r.id);
@@ -745,12 +763,11 @@
           : String(primaryRun.id);
         els.runLink.href = primaryRun.html_url;
         for (const r of dispatchedRuns) {
-          appendLog(`  ✓ Run ${r.id} queued: ${r.html_url} (${r.name})`);
+          appendLog(`  ✓ Matched run ${r.id}: ${r.html_url} (commit ${r.head_sha.slice(0, 7)}, ${r.path})`);
         }
         els.progressBar.style.width = "20%";
 
-        // 6. Poll until completion (poll the primary run; when it completes,
-        //    also check the others if any)
+        // 6. Poll the run that matches this upload's exact commit SHA.
         startPolling(primaryRun.id);
       } catch (e) {
         appendLog(`✗ ERROR: ${e.message}`);
